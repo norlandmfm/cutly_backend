@@ -1,0 +1,30 @@
+backend/
+├── .config.json
+├── README_backend.txt
+├── __pycache__/
+│   ├── video_cache/
+│   ├── zz_cli_menu.cpython-313.pyc
+│   └── zz_tool_backend.cpython-313.pyc
+├── backend_main.py
+├── core/
+│   ├── .config.json
+│   ├── 00 OUTPUTS/
+│   ├── __init__.py
+│   ├── __pycache__/
+│   │   ├── __init__.cpython-313.pyc
+│   │   ├── item_processor.cpython-313.pyc
+│   │   ├── media.cpython-313.pyc
+│   │   ├── paths_and_config.cpython-313.pyc
+│   │   ├── sources.cpython-313.pyc
+│   │   └── utils.cpython-313.pyc
+│   ├── item_processor.py
+│   ├── media.py
+│   ├── paths_and_config.py
+│   ├── sources.py
+│   └── utils.py
+├── structure.txt
+├── zz_archives/
+│   ├── 00 - backend - 2 - working with UI.7z
+│   └── 00 - backend - original.7z
+├── zz_cli_menu.py
+└── zz_tool_backend.py
