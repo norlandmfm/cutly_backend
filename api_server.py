@@ -533,3 +533,8 @@ def start_batch_job(req: BatchJobRequest, bg: BackgroundTasks):
         }
     bg.add_task(run_batch_thread, job_id, req)
     return {"job_id": job_id, "status": "queued"}
+
+# ------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("api_server:app", host=HOST, port=PORT, reload=RELOAD)

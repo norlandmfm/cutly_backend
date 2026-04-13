@@ -4,7 +4,8 @@
 #  DEMARRAGE DU BACKEND CUTLY (LINUX / RASPBERRY)
 # ===================================================
 
-read -p "Sur quel port lancer le serveur ? (Appuie sur Entree pour garder 8000) : " USER_PORT
+# Port lu depuis .env (fallback 8000)
+USER_PORT=$(grep -E "^PORT=" .env 2>/dev/null | cut -d= -f2 | tr -d ' ')
 USER_PORT=${USER_PORT:-8000}
 
 echo ""
@@ -14,7 +15,7 @@ echo "==================================================="
 echo ""
 
 # ================ KILL PORT
-echo "[*] Etape 1 : Verification du port $USER_PORT..."
+echo "[*] Etape 1 : Liberation du port $USER_PORT..."
 fuser -k $USER_PORT/tcp > /dev/null 2>&1
 sleep 1
 echo "[OK] Voie libre !"
@@ -45,11 +46,11 @@ else
 fi
 echo ""
 
-# ================ LANCEMENT
+# ================ LANCEMENT (port et config depuis .env)
 echo "[*] Lancement du serveur Python..."
 echo "==================================================="
 
-./venv/bin/python3 -m uvicorn api_server:app --host 0.0.0.0 --port $USER_PORT --reload
+./venv/bin/python3 api_server.py
 
 echo ""
 echo "[!] Le serveur s'est arrete."
