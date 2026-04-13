@@ -102,47 +102,35 @@ class BatchItem(BaseModel):
     end: Optional[str] = None
 
 class BatchJobRequest(BaseModel):
+    title: Optional[str] = None
     items: List[BatchItem]
-    out_dir: Optional[str] = None
 
 # ------------------------------------------------------------------
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
 
-# ------------------------------------------------------------------
-import os as _os
-
-def resolve_out_dir(custom_dir: Optional[str], video_title: str, extract_title: Optional[str] = None) -> tuple:
+def _server_out_dir(job_id: str, video_title: str, extract_title: Optional[str] = None) -> tuple:
     """
-    Retourne (out_dir, inputs_dir, src_dir) — trois Path absolus.
+    Répertoires de sortie côté serveur — toujours sous ROOT/00 OUTPUTS/{job_id}/.
+    N'utilise jamais les chemins fournis par le client.
 
     Structure créée :
-        {base}/cutly _ videocut app/
-            00 inputs/                  ← FULL.mp4 téléchargés (YouTube)
-            {video_title}/              ← src_dir : SRC link + sous-dossiers extraits
-                {extract_title}/        ← out_dir : fichiers VIDEO (si extrait distinct)
+        ROOT/00 OUTPUTS/{job_id}/
+            00 inputs/          ← FULL.mp4 téléchargés (YouTube)
+            {video_title}/      ← src_dir : SRC link
+                {extract_title}/← out_dir : fichiers VIDEO (si extrait distinct)
     """
     safe_vid = safe_filename(video_title)
     safe_ext = safe_filename(extract_title) if (extract_title and extract_title != video_title) else None
 
-    if custom_dir:
-        base = Path(custom_dir)
-        if not base.is_absolute():
-            base = ROOT / base
-    else:
-        user_profile = _os.environ.get("USERPROFILE", "")
-        base = Path(user_profile) / "Downloads" if user_profile else ROOT / "outputs"
+    base       = ROOT / "00 OUTPUTS" / job_id
+    inputs_dir = base / "00 inputs"
+    src_dir    = base / safe_vid
+    out_dir    = src_dir / safe_ext if safe_ext else src_dir
 
-    root_dir   = base / "cutly _ videocut app"
-    inputs_dir = root_dir / "00 inputs"
-    src_dir    = root_dir / safe_vid                              # video title folder → SRC goes here
-    out_dir    = src_dir / safe_ext if safe_ext else src_dir     # extract subfolder (or same as src_dir)
-
-    inputs_dir.mkdir(parents=True, exist_ok=True)
-    src_dir.mkdir(parents=True, exist_ok=True)
-    if out_dir != src_dir:
-        out_dir.mkdir(parents=True, exist_ok=True)
+    for d in [inputs_dir, src_dir, out_dir]:
+        d.mkdir(parents=True, exist_ok=True)
 
     return out_dir.resolve(), inputs_dir.resolve(), src_dir.resolve()
 
@@ -266,6 +254,26 @@ def download_file(job_id: str, file_type: str):
 #     # Note: pour réellement arrêter le thread, il faudrait gérer un flag dans run_job_thread
 #     return {"job_id": job_id, "status": "cancelled"}
 
+@app.get("/jobs/{job_id}/results/{idx}/download/{file_type}")
+def download_batch_result(job_id: str, idx: int, file_type: str):
+    """Télécharge un fichier vidéo d'un job batch par index de résultat."""
+    with LOCK:
+        job = JOBS.get(job_id)
+    if not job or job.get("status") != "done":
+        raise HTTPException(404, "Job not ready")
+    results = job.get("results", [])
+    if idx < 0 or idx >= len(results):
+        raise HTTPException(404, "Result index out of range")
+    outputs = results[idx].get("outputs", {})
+    file_path_str = outputs.get(file_type)
+    if not file_path_str:
+        raise HTTPException(404, f"File type '{file_type}' not found for result {idx}")
+    file_path = Path(file_path_str)
+    if not file_path.exists():
+        raise HTTPException(404, "File not found on disk")
+    return FileResponse(file_path, filename=file_path.name)
+
+# ------------------------------------------------------------------
 @app.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
     with LOCK:
@@ -320,7 +328,7 @@ def run_job_thread(job_id: str, req: SingleJobRequest, timeout_sec: int = 300):
 
         video_title   = req.video_title or req.title
         extract_title = req.title if req.video_title else None
-        out_dir, inputs_dir, src_dir = resolve_out_dir(req.out_dir, video_title, extract_title)
+        out_dir, inputs_dir, src_dir = _server_out_dir(job_id, video_title, extract_title)
 
         # --------------------------------------------------
         # Step tracker — visible côté Flutter via polling
@@ -476,7 +484,7 @@ def run_batch_thread(job_id: str, req: BatchJobRequest):
         for idx, item in enumerate(req.items, start=1):
             if JOBS[job_id]["cancelled"]:
                 break
-            out_dir, inputs_dir, src_dir = resolve_out_dir(req.out_dir, item.title)
+            out_dir, inputs_dir, src_dir = _server_out_dir(job_id, item.title)
             process_item(
                 it={
                     "title": item.title,
@@ -526,6 +534,7 @@ def start_batch_job(req: BatchJobRequest, bg: BackgroundTasks):
             "job_id": job_id,
             "status": "queued",
             "type": "batch",
+            "title": req.title or f"Batch ({len(req.items)} items)",
             "items": len(req.items),
             "results": [],
             "logs": "",
