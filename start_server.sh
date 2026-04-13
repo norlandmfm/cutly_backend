@@ -50,6 +50,8 @@ echo ""
 echo "[*] Lancement du serveur Python..."
 echo "==================================================="
 
+# Ajoute venv/bin au PATH pour que yt-dlp, ffmpeg etc. soient trouvables par subprocess
+export PATH="$(pwd)/venv/bin:$PATH"
 ./venv/bin/python3 api_server.py
 
 echo ""
