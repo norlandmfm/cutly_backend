@@ -274,6 +274,38 @@ def download_batch_result(job_id: str, idx: int, file_type: str):
     return FileResponse(file_path, filename=file_path.name)
 
 # ------------------------------------------------------------------
+@app.get("/jobs/{job_id}/files")
+def list_job_files(job_id: str):
+    """Scanne le dossier 00 OUTPUTS/{job_id}/ et retourne tous les fichiers vidéo."""
+    job_dir = ROOT / "00 OUTPUTS" / job_id
+    if not job_dir.exists():
+        raise HTTPException(404, "Job output directory not found")
+    files = []
+    for f in sorted(job_dir.rglob("*")):
+        if not f.is_file():
+            continue
+        # Inclure les vidéos (.mp4), exclure les FULL (inputs bruts)
+        if f.suffix.lower() == ".mp4" and "- full" not in f.name.lower():
+            files.append({
+                "name": f.name,
+                "path": str(f.relative_to(job_dir)),
+                "size": f.stat().st_size,
+            })
+    return {"job_id": job_id, "files": files}
+
+@app.get("/jobs/{job_id}/download_file")
+def download_job_file(job_id: str, path: str):
+    """Télécharge un fichier spécifique par son chemin relatif dans 00 OUTPUTS/{job_id}/."""
+    job_dir = ROOT / "00 OUTPUTS" / job_id
+    file_path = (job_dir / path).resolve()
+    # Sécurité : vérifier que le fichier est bien dans job_dir
+    if not str(file_path).startswith(str(job_dir.resolve())):
+        raise HTTPException(403, "Access denied")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(404, "File not found")
+    return FileResponse(file_path, filename=file_path.name)
+
+# ------------------------------------------------------------------
 @app.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
     with LOCK:
