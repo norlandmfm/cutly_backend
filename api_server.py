@@ -1,4 +1,12 @@
 # backend/api_server.py
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", 8000))
+RELOAD = os.getenv("RELOAD", "True").lower() in ("true", "1", "t")
+
 from datetime import time
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse

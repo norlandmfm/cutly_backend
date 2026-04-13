@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 pydantic
 yt-dlp
+python-dotenv
