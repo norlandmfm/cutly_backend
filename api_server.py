@@ -576,6 +576,123 @@ def start_batch_job(req: BatchJobRequest, bg: BackgroundTasks):
     return {"job_id": job_id, "status": "queued"}
 
 # ------------------------------------------------------------------
+# STRIPE PAYMENT ENDPOINTS
+# ------------------------------------------------------------------
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+# Credit packs: id → (credits, price_cents)
+CREDIT_PACKS = {
+    "sos":     (10,    149),    # 1.49 EUR
+    "starter": (100,   499),    # 4.99 EUR
+    "popular": (300,   999),    # 9.99 EUR
+    "pro":     (1000,  2499),   # 24.99 EUR
+}
+
+class CheckoutRequest(BaseModel):
+    pack_id: str
+    uid: str
+
+@app.post("/payments/create-checkout")
+def create_checkout(req: CheckoutRequest):
+    """Create a Stripe Checkout session for a credit pack."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Stripe not configured (set STRIPE_SECRET_KEY in .env)")
+
+    pack = CREDIT_PACKS.get(req.pack_id)
+    if not pack:
+        raise HTTPException(400, f"Unknown pack: {req.pack_id}")
+
+    credits, price_cents = pack
+
+    try:
+        import stripe
+        stripe.api_key = STRIPE_SECRET_KEY
+
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            mode="payment",
+            line_items=[{
+                "price_data": {
+                    "currency": "eur",
+                    "unit_amount": price_cents,
+                    "product_data": {
+                        "name": f"Cutly — {credits} credits ({req.pack_id})",
+                    },
+                },
+                "quantity": 1,
+            }],
+            metadata={
+                "uid": req.uid,
+                "pack_id": req.pack_id,
+                "credits": str(credits),
+            },
+            success_url="https://cutly.app/payment-success?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url="https://cutly.app/payment-cancel",
+        )
+        return {"checkout_url": session.url}
+
+    except ImportError:
+        raise HTTPException(503, "stripe package not installed (pip install stripe)")
+    except Exception as e:
+        raise HTTPException(500, f"Stripe error: {e}")
+
+
+from fastapi import Request
+
+@app.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    """Handle Stripe webhooks — credit user's Firestore account after payment."""
+    if not STRIPE_SECRET_KEY or not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(503, "Stripe webhook not configured")
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    try:
+        import stripe
+        stripe.api_key = STRIPE_SECRET_KEY
+
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except ImportError:
+        raise HTTPException(503, "stripe package not installed")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(400, "Invalid signature")
+    except Exception as e:
+        raise HTTPException(400, f"Webhook error: {e}")
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        uid = session.get("metadata", {}).get("uid")
+        credits_str = session.get("metadata", {}).get("credits", "0")
+        credits = int(credits_str)
+
+        if uid and credits > 0:
+            # Update Firestore via Firebase Admin SDK
+            try:
+                import firebase_admin
+                from firebase_admin import firestore as fb_firestore
+
+                if not firebase_admin._apps:
+                    firebase_admin.initialize_app()
+
+                db = fb_firestore.client()
+                user_ref = db.collection("users").document(uid)
+                user_ref.update({
+                    "credits": fb_firestore.Increment(credits),
+                })
+                print(f"[Stripe] Credited {credits} to user {uid}")
+            except Exception as e:
+                print(f"[Stripe] Failed to credit user {uid}: {e}")
+                # Don't return error to Stripe — we'll handle manually
+                # Log for retry/manual investigation
+
+    return {"status": "ok"}
+
+
+# ------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api_server:app", host=HOST, port=PORT, reload=RELOAD)
