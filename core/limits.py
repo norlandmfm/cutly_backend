@@ -26,12 +26,24 @@ _DEFAULTS: Dict[str, int] = {
 
 _CONFIG_TTL_SEC = 60.0
 _PLAN_TTL_SEC = 300.0
+_ADMIN_TTL_SEC = 300.0
+
+# Hardcoded admin email whitelist — MUST match lib/services/auth_service.dart
+# `_adminEmails`. Keeping it here (not in Firestore) means a compromised
+# Firestore doc cannot grant admin bypass, and it survives Firestore outages.
+# Compare lowercase.
+_ADMIN_EMAILS = {
+    "norlandmfouemo@gmail.com",
+}
 
 _config_cache: Dict[str, object] = {"data": None, "ts": 0.0}
 _config_lock = threading.Lock()
 
 _user_plan_cache: Dict[str, Tuple[str, float]] = {}
 _plan_lock = threading.Lock()
+
+_user_admin_cache: Dict[str, Tuple[bool, float]] = {}
+_admin_lock = threading.Lock()
 
 
 def _read_firestore_config() -> Dict[str, int]:
@@ -98,6 +110,45 @@ def _read_user_plan(uid: Optional[str]) -> str:
     return plan
 
 
+def _is_admin(uid: Optional[str]) -> bool:
+    """Return True when the Firebase Auth email for [uid] is whitelisted.
+
+    Resolution order:
+      1. firebase_admin.auth.get_user(uid).email — canonical source, can't be
+         spoofed by the client.
+      2. /users/{uid}.email Firestore field — fallback only if Auth SDK fails
+         (e.g. Auth Admin not initialised). Users with write access to their
+         own doc could theoretically fake this, so it's disabled by default:
+         the Flutter client never writes 'email' to the doc anyway.
+    Cached 5min keyed by uid. Returns False on any error — fail closed.
+    """
+    if not uid:
+        return False
+    now = time.time()
+    with _admin_lock:
+        cached = _user_admin_cache.get(uid)
+        if cached and now - cached[1] < _ADMIN_TTL_SEC:
+            return cached[0]
+
+    is_admin = False
+    try:
+        import firebase_admin  # type: ignore
+        from firebase_admin import auth as fb_auth  # type: ignore
+
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app()
+        rec = fb_auth.get_user(uid)
+        email = (rec.email or "").strip().lower()
+        if email and email in _ADMIN_EMAILS:
+            is_admin = True
+    except Exception as e:  # noqa: BLE001
+        print(f"[limits] admin lookup failed for {uid}: {e}")
+
+    with _admin_lock:
+        _user_admin_cache[uid] = (is_admin, time.time())
+    return is_admin
+
+
 def get_limits(uid: Optional[str]) -> Tuple[int, int, str]:
     """Return (max_concurrent, rate_per_hour, plan) for [uid]."""
     cfg = _read_firestore_config()
@@ -127,7 +178,13 @@ class UserLimits:
           - ('ok', {'concurrent': N, 'used_hour': N, 'plan': 'free'|'paid'})
           - ('rate_limited', {'retry_after': sec, 'limit': N, 'plan': ...})
           - ('too_many', {'limit': N, 'active': N, 'plan': ...})
+
+        Admins (email whitelist, resolved via Firebase Auth) bypass both
+        checks entirely — the UI's AdminMode.bypassLimits toggle is
+        honoured server-side too so dev/debug isn't gated.
         """
+        if _is_admin(uid):
+            return True, "ok", {"concurrent": 0, "used_hour": 0, "plan": "admin"}
         key = uid or "_anon_"
         max_concurrent, rate_per_hour, plan = get_limits(uid)
         now = time.time()
@@ -171,6 +228,14 @@ class UserLimits:
     @classmethod
     def status(cls, uid: Optional[str]) -> Dict[str, object]:
         """Read-only snapshot for diagnostics (GET /limits/status)."""
+        if _is_admin(uid):
+            return {
+                "uid": uid,
+                "plan": "admin",
+                "concurrent": {"active": 0, "limit": None},
+                "rate": {"used_hour": 0, "limit": None},
+                "bypass": True,
+            }
         key = uid or "_anon_"
         max_concurrent, rate_per_hour, plan = get_limits(uid)
         now = time.time()
@@ -189,9 +254,11 @@ class UserLimits:
 
 
 def invalidate_caches() -> None:
-    """Drop config + plan caches. Useful for tests or after admin updates config."""
+    """Drop config + plan + admin caches. Useful for tests or after admin updates config."""
     with _config_lock:
         _config_cache["data"] = None
         _config_cache["ts"] = 0.0
     with _plan_lock:
         _user_plan_cache.clear()
+    with _admin_lock:
+        _user_admin_cache.clear()
