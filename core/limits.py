@@ -24,18 +24,18 @@ from typing import Deque, Dict, Optional, Tuple
 # Defaults MUST match lib/models/app_config.dart defaults so behavior stays
 # consistent when Firestore is unreachable. 0 = unlimited sentinel.
 _DEFAULTS: Dict[str, int] = {
-    # concurrent jobs per tier
+    # concurrent jobs per tier (hard server-side cap: 4)
     "maxConcurrentJobsFree": 1,
     "maxConcurrentJobsStarter": 1,
     "maxConcurrentJobsPopular": 2,
     "maxConcurrentJobsPro": 3,
-    "maxConcurrentJobsStudio": 5,
+    "maxConcurrentJobsStudio": 4,
     # rate limit (jobs/hour) per tier
     "rateLimitJobsPerHourFree": 5,
     "rateLimitJobsPerHourStarter": 10,
     "rateLimitJobsPerHourPopular": 20,
     "rateLimitJobsPerHourPro": 40,
-    "rateLimitJobsPerHourStudio": 100,
+    "rateLimitJobsPerHourStudio": 80,
     # legacy fallbacks (old admin docs) — read-only here, used only if a
     # tier-specific key is missing from remote. Never written back.
     "maxConcurrentJobsPaid": 3,
