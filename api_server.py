@@ -29,6 +29,7 @@ sys.path.append(str(ROOT))
 from core.utils import ensure_requirements, safe_filename
 from core.item_processor import process_item
 from core.paths_and_config import resolve_output_directory
+from core.limits import UserLimits
 
 # ------------------------------------------------------------------
 # Thread-local logger — fixes concurrent-job UnicodeEncodeError on Windows cp1252 console.
@@ -94,6 +95,7 @@ class SingleJobRequest(BaseModel):
     start: Optional[str] = None
     end: Optional[str] = None
     out_dir: Optional[str] = None
+    uid: Optional[str] = None          # Firebase uid — drives per-user limits
 
 class BatchItem(BaseModel):
     title: str
@@ -104,6 +106,34 @@ class BatchItem(BaseModel):
 class BatchJobRequest(BaseModel):
     title: Optional[str] = None
     items: List[BatchItem]
+    uid: Optional[str] = None          # Firebase uid — drives per-user limits
+
+
+def _raise_limit_error(code: str, info: dict):
+    """Map limit-check codes to proper HTTP errors (409/429) with structured detail
+    so the Flutter client can branch on error.detail.code."""
+    if code == "too_many":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "too_many_concurrent_jobs",
+                "limit": info.get("limit"),
+                "active": info.get("active"),
+                "plan": info.get("plan"),
+            },
+        )
+    if code == "rate_limited":
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "rate_limited",
+                "limit": info.get("limit"),
+                "retry_after": info.get("retry_after"),
+                "plan": info.get("plan"),
+            },
+        )
+    # Should never happen — fail closed.
+    raise HTTPException(status_code=500, detail={"code": code, "info": info})
 
 # ------------------------------------------------------------------
 @app.get("/ping")
@@ -186,6 +216,12 @@ def collect_outputs(out_dir: Path, inputs_dir: Path = None, src_dir: Path = None
 
 @app.post("/jobs/single")
 def start_single_job(req: SingleJobRequest, bg: BackgroundTasks):
+    # Per-user limits must pass BEFORE queueing, so 409/429 surfaces synchronously
+    # to the client. release() is called by the worker thread's finally.
+    allowed, code, info = UserLimits.reserve(req.uid)
+    if not allowed:
+        _raise_limit_error(code, info)
+
     job_id = str(uuid.uuid4())[:8]
     with LOCK:
         JOBS[job_id] = {
@@ -198,9 +234,10 @@ def start_single_job(req: SingleJobRequest, bg: BackgroundTasks):
             "step": "En attente...",
             "error": "",
             "cancelled": False,
+            "uid": req.uid,
         }
     bg.add_task(run_job_thread_limited, job_id, req)
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id, "status": "queued", "limits": info}
 
 
 # ------------------------------------------------------------------
@@ -485,8 +522,12 @@ active_jobs_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
 #         JOBS[job_id]["progress"] = 5
 
 def run_job_thread_limited(job_id: str, req: SingleJobRequest):
-    with active_jobs_semaphore:
-        run_job_thread(job_id, req)
+    try:
+        with active_jobs_semaphore:
+            run_job_thread(job_id, req)
+    finally:
+        # Always release the per-user slot, even on crash / semaphore timeout.
+        UserLimits.release(req.uid)
 
 
 
@@ -560,6 +601,11 @@ def run_batch_thread(job_id: str, req: BatchJobRequest):
 # ------------------------------------------------------------------
 @app.post("/jobs/batch")
 def start_batch_job(req: BatchJobRequest, bg: BackgroundTasks):
+    # Batch counts as a single reservation — one slot, one rate-tick.
+    allowed, code, info = UserLimits.reserve(req.uid)
+    if not allowed:
+        _raise_limit_error(code, info)
+
     job_id = str(uuid.uuid4())[:8]
     with LOCK:
         JOBS[job_id] = {
@@ -571,9 +617,24 @@ def start_batch_job(req: BatchJobRequest, bg: BackgroundTasks):
             "results": [],
             "logs": "",
             "cancelled": False,
+            "uid": req.uid,
         }
-    bg.add_task(run_batch_thread, job_id, req)
-    return {"job_id": job_id, "status": "queued"}
+    bg.add_task(_run_batch_thread_limited, job_id, req)
+    return {"job_id": job_id, "status": "queued", "limits": info}
+
+
+def _run_batch_thread_limited(job_id: str, req: BatchJobRequest):
+    try:
+        run_batch_thread(job_id, req)
+    finally:
+        UserLimits.release(req.uid)
+
+
+@app.get("/limits/status")
+def get_limits_status(uid: Optional[str] = None):
+    """Diagnostics: return current concurrent + rate usage for the given uid.
+    Used by the Flutter UI to show a little indicator + by tests."""
+    return UserLimits.status(uid)
 
 # ------------------------------------------------------------------
 # STRIPE PAYMENT ENDPOINTS
