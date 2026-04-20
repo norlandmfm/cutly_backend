@@ -26,20 +26,20 @@ from typing import Deque, Dict, Optional, Tuple
 _DEFAULTS: Dict[str, int] = {
     # concurrent jobs per tier
     "maxConcurrentJobsFree": 1,
-    "maxConcurrentJobsStarter": 2,
+    "maxConcurrentJobsStarter": 1,
     "maxConcurrentJobsPopular": 2,
     "maxConcurrentJobsPro": 3,
     "maxConcurrentJobsStudio": 5,
     # rate limit (jobs/hour) per tier
-    "rateLimitJobsPerHourFree": 10,
-    "rateLimitJobsPerHourStarter": 20,
-    "rateLimitJobsPerHourPopular": 40,
-    "rateLimitJobsPerHourPro": 60,
-    "rateLimitJobsPerHourStudio": 120,
+    "rateLimitJobsPerHourFree": 5,
+    "rateLimitJobsPerHourStarter": 10,
+    "rateLimitJobsPerHourPopular": 20,
+    "rateLimitJobsPerHourPro": 40,
+    "rateLimitJobsPerHourStudio": 100,
     # legacy fallbacks (old admin docs) — read-only here, used only if a
     # tier-specific key is missing from remote. Never written back.
     "maxConcurrentJobsPaid": 3,
-    "rateLimitJobsPerHourPaid": 60,
+    "rateLimitJobsPerHourPaid": 40,
 }
 
 _PAID_TIERS = ("starter", "popular", "pro", "studio")
