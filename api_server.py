@@ -30,6 +30,7 @@ from core.utils import ensure_requirements, safe_filename
 from core.item_processor import process_item
 from core.paths_and_config import resolve_output_directory
 from core.limits import UserLimits
+from core import purger
 
 # ------------------------------------------------------------------
 # Thread-local logger — fixes concurrent-job UnicodeEncodeError on Windows cp1252 console.
@@ -635,6 +636,30 @@ def get_limits_status(uid: Optional[str] = None):
     """Diagnostics: return current concurrent + rate usage for the given uid.
     Used by the Flutter UI to show a little indicator + by tests."""
     return UserLimits.status(uid)
+
+
+# ------------------------------------------------------------------
+# STORAGE PURGER (G10) — auto-deletes old job outputs
+# ------------------------------------------------------------------
+
+@app.on_event("startup")
+def _boot_purger():
+    """Kick off the background purger once the ASGI app is ready.
+    Runs an initial pass so a server restart catches stale dirs from
+    previous lives, then every [PURGE_INTERVAL_SEC] (1h by default)."""
+    purger.start(ROOT, lambda: JOBS)
+
+
+@app.on_event("shutdown")
+def _stop_purger():
+    purger.stop()
+
+
+@app.post("/maintenance/purge")
+def maintenance_purge():
+    """Manual trigger — runs one purge pass and returns stats.
+    Useful for tests, ops, or a 'force cleanup' admin button."""
+    return purger.run_manual(ROOT, JOBS)
 
 # ------------------------------------------------------------------
 # STRIPE PAYMENT ENDPOINTS
