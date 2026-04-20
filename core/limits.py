@@ -1,9 +1,15 @@
 """Per-user concurrency + rate limiting for Cutly backend.
 
 Pulls caps from Firestore `/config/app_config` (60s in-memory cache) and the
-user's `plan` field from `/users/{uid}` (5min cache). Falls back to hard-coded
-defaults when Firebase Admin isn't configured or reads fail — the backend
-still enforces *some* cap instead of becoming a free-for-all.
+user's `plan` + `planExpiresAt` fields from `/users/{uid}` (5min cache). Falls
+back to hard-coded defaults when Firebase Admin isn't configured or reads fail
+— the backend still enforces *some* cap instead of becoming a free-for-all.
+
+Tiered limits (mirrors Dart `PlanLimits.of` + JS `historyCapFor`):
+    free / starter / popular / pro / studio
+A Firestore config value of **0** on any `maxConcurrentJobs<Tier>` or
+`rateLimitJobsPerHour<Tier>` field is the *unlimited* sentinel (typically
+Studio). Admin bypass is unconditional.
 
 Call [reserve] before accepting a job → returns (allowed, code, info).
 Call [release] in the job thread's finally → always, even on error.
@@ -15,14 +21,28 @@ import time
 from collections import defaultdict, deque
 from typing import Deque, Dict, Optional, Tuple
 
-# Defaults MUST match lib/models/app_config.dart defaults so behavior is
-# consistent when Firestore is unreachable.
+# Defaults MUST match lib/models/app_config.dart defaults so behavior stays
+# consistent when Firestore is unreachable. 0 = unlimited sentinel.
 _DEFAULTS: Dict[str, int] = {
+    # concurrent jobs per tier
     "maxConcurrentJobsFree": 1,
-    "maxConcurrentJobsPaid": 3,
+    "maxConcurrentJobsStarter": 2,
+    "maxConcurrentJobsPopular": 2,
+    "maxConcurrentJobsPro": 3,
+    "maxConcurrentJobsStudio": 5,
+    # rate limit (jobs/hour) per tier
     "rateLimitJobsPerHourFree": 10,
+    "rateLimitJobsPerHourStarter": 20,
+    "rateLimitJobsPerHourPopular": 40,
+    "rateLimitJobsPerHourPro": 60,
+    "rateLimitJobsPerHourStudio": 120,
+    # legacy fallbacks (old admin docs) — read-only here, used only if a
+    # tier-specific key is missing from remote. Never written back.
+    "maxConcurrentJobsPaid": 3,
     "rateLimitJobsPerHourPaid": 60,
 }
+
+_PAID_TIERS = ("starter", "popular", "pro", "studio")
 
 _CONFIG_TTL_SEC = 60.0
 _PLAN_TTL_SEC = 300.0
@@ -39,7 +59,8 @@ _ADMIN_EMAILS = {
 _config_cache: Dict[str, object] = {"data": None, "ts": 0.0}
 _config_lock = threading.Lock()
 
-_user_plan_cache: Dict[str, Tuple[str, float]] = {}
+# Value: (plan, plan_expires_at_epoch_or_None, cached_at)
+_user_plan_cache: Dict[str, Tuple[str, Optional[float], float]] = {}
 _plan_lock = threading.Lock()
 
 _user_admin_cache: Dict[str, Tuple[bool, float]] = {}
@@ -68,7 +89,8 @@ def _read_firestore_config() -> Dict[str, int]:
             remote = snap.to_dict() or {}
             for key in _DEFAULTS:
                 v = remote.get(key)
-                if isinstance(v, int) and v > 0:
+                # 0 is a valid sentinel (unlimited) for tiered keys, so keep it.
+                if isinstance(v, int) and v >= 0:
                     merged[key] = v
     except Exception as e:  # noqa: BLE001 — all errors → defaults + log
         print(f"[limits] Firestore config read failed, using defaults: {e}")
@@ -79,17 +101,46 @@ def _read_firestore_config() -> Dict[str, int]:
     return dict(merged)
 
 
+def _epoch_from_ts(v) -> Optional[float]:
+    """Coerce Firestore Timestamp / datetime / int / str → epoch seconds. None-safe."""
+    if v is None:
+        return None
+    try:
+        # firebase_admin returns google.cloud.firestore Timestamp objects that
+        # expose `.timestamp()`. Python datetime does too.
+        if hasattr(v, "timestamp"):
+            return float(v.timestamp())
+        if isinstance(v, (int, float)):
+            # Heuristic: milliseconds if > 10^12, else seconds.
+            return float(v) / 1000.0 if v > 1_000_000_000_000 else float(v)
+        if isinstance(v, str):
+            from datetime import datetime
+            return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _read_user_plan(uid: Optional[str]) -> str:
-    """Return 'paid' when user doc has plan == 'paid', else 'free'. Cached 5min."""
+    """Return the user's effective plan, applying self-heal for expiry.
+
+    Result is one of: 'free', 'starter', 'popular', 'pro', 'studio'. Unknown
+    legacy values (e.g. 'paid') are normalized to 'pro' for backwards-compat,
+    since old purchase flows credited a generic paid tier.
+    """
     if not uid:
         return "free"
     now = time.time()
     with _plan_lock:
         cached = _user_plan_cache.get(uid)
-        if cached and now - cached[1] < _PLAN_TTL_SEC:
-            return cached[0]
+        if cached and now - cached[2] < _PLAN_TTL_SEC:
+            plan, exp, _ = cached
+            if plan != "free" and exp is not None and now > exp:
+                return "free"
+            return plan
 
     plan = "free"
+    expires_at: Optional[float] = None
     try:
         import firebase_admin  # type: ignore
         from firebase_admin import firestore as fb_firestore  # type: ignore
@@ -99,14 +150,23 @@ def _read_user_plan(uid: Optional[str]) -> str:
         db = fb_firestore.client()
         snap = db.collection("users").document(uid).get()
         if snap.exists:
-            p = (snap.to_dict() or {}).get("plan")
-            if p == "paid":
-                plan = "paid"
+            data = snap.to_dict() or {}
+            raw = str(data.get("plan") or "free").strip().lower()
+            if raw in ("free", "starter", "popular", "pro", "studio"):
+                plan = raw
+            elif raw == "paid":
+                plan = "pro"  # legacy mapping
+            expires_at = _epoch_from_ts(data.get("planExpiresAt"))
     except Exception as e:  # noqa: BLE001
         print(f"[limits] user plan read failed for {uid}: {e}")
 
     with _plan_lock:
-        _user_plan_cache[uid] = (plan, time.time())
+        _user_plan_cache[uid] = (plan, expires_at, time.time())
+
+    # Self-heal: if expired, surface Free so caps apply immediately even
+    # before the daily cron sweeps the stale doc.
+    if plan != "free" and expires_at is not None and time.time() > expires_at:
+        return "free"
     return plan
 
 
@@ -114,12 +174,9 @@ def _is_admin(uid: Optional[str]) -> bool:
     """Return True when the Firebase Auth email for [uid] is whitelisted.
 
     Resolution order:
-      1. firebase_admin.auth.get_user(uid).email — canonical source, can't be
-         spoofed by the client.
-      2. /users/{uid}.email Firestore field — fallback only if Auth SDK fails
-         (e.g. Auth Admin not initialised). Users with write access to their
-         own doc could theoretically fake this, so it's disabled by default:
-         the Flutter client never writes 'email' to the doc anyway.
+      1. firebase_admin.auth.get_user(uid).email — canonical, un-spoofable.
+      2. /users/{uid}.email Firestore field — fallback only if Auth SDK fails.
+
     Cached 5min keyed by uid. Returns False on any error — fail closed.
     """
     if not uid:
@@ -149,13 +206,38 @@ def _is_admin(uid: Optional[str]) -> bool:
     return is_admin
 
 
-def get_limits(uid: Optional[str]) -> Tuple[int, int, str]:
-    """Return (max_concurrent, rate_per_hour, plan) for [uid]."""
+def _tier_cap(cfg: Dict[str, int], base_key: str, tier: str) -> int:
+    """Resolve cfg[f'{base_key}<Tier>'] with legacy fallback.
+
+    0 is preserved (unlimited sentinel). Unknown tiers fall back to Free.
+    """
+    tier = (tier or "free").lower()
+    tier_key = f"{base_key}{tier.capitalize()}"
+    if tier_key in cfg:
+        return int(cfg[tier_key])
+    # legacy fallback for pre-tier admin docs
+    if tier in _PAID_TIERS:
+        legacy = f"{base_key}Paid"
+        if legacy in cfg:
+            return int(cfg[legacy])
+    return int(cfg.get(f"{base_key}Free", 1))
+
+
+def get_limits(uid: Optional[str]) -> Tuple[Optional[int], Optional[int], str]:
+    """Return (max_concurrent, rate_per_hour, plan) for [uid].
+
+    Values can be None, meaning *unlimited* — caller must skip the check when
+    None. Typically Studio returns (None, None, 'studio').
+    """
     cfg = _read_firestore_config()
     plan = _read_user_plan(uid)
-    if plan == "paid":
-        return int(cfg["maxConcurrentJobsPaid"]), int(cfg["rateLimitJobsPerHourPaid"]), plan
-    return int(cfg["maxConcurrentJobsFree"]), int(cfg["rateLimitJobsPerHourFree"]), plan
+    concur = _tier_cap(cfg, "maxConcurrentJobs", plan)
+    rate = _tier_cap(cfg, "rateLimitJobsPerHour", plan)
+    return (
+        None if concur <= 0 else int(concur),
+        None if rate <= 0 else int(rate),
+        plan,
+    )
 
 
 class UserLimits:
@@ -175,13 +257,13 @@ class UserLimits:
         success. Also records the timestamp for rate-limit tracking.
 
         Returns (allowed, code, info):
-          - ('ok', {'concurrent': N, 'used_hour': N, 'plan': 'free'|'paid'})
-          - ('rate_limited', {'retry_after': sec, 'limit': N, 'plan': ...})
-          - ('too_many', {'limit': N, 'active': N, 'plan': ...})
+          - (True, 'ok',           {'concurrent': N, 'used_hour': N, 'plan': ...})
+          - (False, 'rate_limited', {'retry_after': sec, 'limit': N, 'plan': ...})
+          - (False, 'too_many',     {'limit': N, 'active': N, 'plan': ...})
 
         Admins (email whitelist, resolved via Firebase Auth) bypass both
-        checks entirely — the UI's AdminMode.bypassLimits toggle is
-        honoured server-side too so dev/debug isn't gated.
+        checks entirely. Studio tier (unlimited sentinel) also bypasses each
+        check it has unlimited for, independently.
         """
         if _is_admin(uid):
             return True, "ok", {"concurrent": 0, "used_hour": 0, "plan": "admin"}
@@ -194,7 +276,7 @@ class UserLimits:
             while h and h[0] < hour_ago:
                 h.popleft()
 
-            if len(h) >= rate_per_hour:
+            if rate_per_hour is not None and len(h) >= rate_per_hour:
                 retry_after = int(max(1, h[0] + 3600.0 - now))
                 return False, "rate_limited", {
                     "retry_after": retry_after,
@@ -202,7 +284,7 @@ class UserLimits:
                     "plan": plan,
                 }
 
-            if cls._concurrent[key] >= max_concurrent:
+            if max_concurrent is not None and cls._concurrent[key] >= max_concurrent:
                 return False, "too_many", {
                     "limit": max_concurrent,
                     "active": cls._concurrent[key],
@@ -242,7 +324,6 @@ class UserLimits:
         hour_ago = now - 3600.0
         with cls._lock:
             h = cls._history[key]
-            # prune without mutating caller behavior
             used = sum(1 for t in h if t >= hour_ago)
             active = cls._concurrent[key]
         return {
