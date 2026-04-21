@@ -662,17 +662,42 @@ def maintenance_purge():
     return purger.run_manual(ROOT, JOBS)
 
 # ------------------------------------------------------------------
-# STRIPE PAYMENT ENDPOINTS
+# STRIPE — CHECKOUT SESSION CREATION
 # ------------------------------------------------------------------
+# This backend owns ONLY the checkout-session creation flow. The
+# post-payment webhook (`checkout.session.completed`) is handled by
+# the Firebase Cloud Function `stripeWebhook` (see functions/index.js)
+# which offers idempotency via Firestore ledger entries, plan
+# duration stacking, and tighter coupling with the user doc. Keeping
+# webhook logic out of this process-local backend removes the risk
+# of a Raspberry / laptop downtime causing Stripe retries to double-
+# credit users.
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
-# Credit packs: id → (credits, price_cents)
+# Checkout redirect URLs — overridable via env so we can point to a
+# Firebase Hosting staging URL during beta and swap to the final
+# landing domain without touching code. `{CHECKOUT_SESSION_ID}` is
+# substituted by Stripe at redirect time.
+STRIPE_SUCCESS_URL = os.getenv(
+    "STRIPE_SUCCESS_URL",
+    "https://cutly.app/payment-success?session_id={CHECKOUT_SESSION_ID}",
+)
+STRIPE_CANCEL_URL = os.getenv(
+    "STRIPE_CANCEL_URL",
+    "https://cutly.app/payment-cancel",
+)
+
+# Credit packs: id → (credits, price_cents).
+# MUST stay in sync with packs_for() / AppConfig defaults on the
+# Flutter side + resolvePack() in functions/index.js. The Cloud
+# Function webhook recomputes credits from /config/app_config, so
+# this dict is only authoritative for pricing + Stripe line items.
 CREDIT_PACKS = {
     "sos":     (10,    149),    # 1.49 EUR
     "starter": (100,   499),    # 4.99 EUR
     "popular": (300,   999),    # 9.99 EUR
     "pro":     (1000,  2499),   # 24.99 EUR
+    "studio":  (2500,  4999),   # 49.99 EUR — V2/admin-gated on the client
 }
 
 class CheckoutRequest(BaseModel):
@@ -681,7 +706,15 @@ class CheckoutRequest(BaseModel):
 
 @app.post("/payments/create-checkout")
 def create_checkout(req: CheckoutRequest):
-    """Create a Stripe Checkout session for a credit pack."""
+    """Create a Stripe Checkout session for a credit pack.
+
+    The session embeds the Firebase UID as both `client_reference_id`
+    (Stripe-idiomatic) and a `metadata.uid` fallback so the Cloud
+    Function webhook can always resolve the buyer. `metadata.pack_id`
+    is the single source of truth the webhook uses to credit the
+    correct pack — the legacy `credits` field is intentionally not
+    sent to avoid drift when the admin edits /config/app_config.
+    """
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Stripe not configured (set STRIPE_SECRET_KEY in .env)")
 
@@ -698,6 +731,7 @@ def create_checkout(req: CheckoutRequest):
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
             mode="payment",
+            client_reference_id=req.uid,
             line_items=[{
                 "price_data": {
                     "currency": "eur",
@@ -711,10 +745,9 @@ def create_checkout(req: CheckoutRequest):
             metadata={
                 "uid": req.uid,
                 "pack_id": req.pack_id,
-                "credits": str(credits),
             },
-            success_url="https://cutly.app/payment-success?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url="https://cutly.app/payment-cancel",
+            success_url=STRIPE_SUCCESS_URL,
+            cancel_url=STRIPE_CANCEL_URL,
         )
         return {"checkout_url": session.url}
 
@@ -722,60 +755,6 @@ def create_checkout(req: CheckoutRequest):
         raise HTTPException(503, "stripe package not installed (pip install stripe)")
     except Exception as e:
         raise HTTPException(500, f"Stripe error: {e}")
-
-
-from fastapi import Request
-
-@app.post("/webhook/stripe")
-async def stripe_webhook(request: Request):
-    """Handle Stripe webhooks — credit user's Firestore account after payment."""
-    if not STRIPE_SECRET_KEY or not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(503, "Stripe webhook not configured")
-
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature", "")
-
-    try:
-        import stripe
-        stripe.api_key = STRIPE_SECRET_KEY
-
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
-    except ImportError:
-        raise HTTPException(503, "stripe package not installed")
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(400, "Invalid signature")
-    except Exception as e:
-        raise HTTPException(400, f"Webhook error: {e}")
-
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        uid = session.get("metadata", {}).get("uid")
-        credits_str = session.get("metadata", {}).get("credits", "0")
-        credits = int(credits_str)
-
-        if uid and credits > 0:
-            # Update Firestore via Firebase Admin SDK
-            try:
-                import firebase_admin
-                from firebase_admin import firestore as fb_firestore
-
-                if not firebase_admin._apps:
-                    firebase_admin.initialize_app()
-
-                db = fb_firestore.client()
-                user_ref = db.collection("users").document(uid)
-                user_ref.update({
-                    "credits": fb_firestore.Increment(credits),
-                })
-                print(f"[Stripe] Credited {credits} to user {uid}")
-            except Exception as e:
-                print(f"[Stripe] Failed to credit user {uid}: {e}")
-                # Don't return error to Stripe — we'll handle manually
-                # Log for retry/manual investigation
-
-    return {"status": "ok"}
 
 
 # ------------------------------------------------------------------
