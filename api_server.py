@@ -674,17 +674,18 @@ def maintenance_purge():
 # credit users.
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 
-# Checkout redirect URLs — overridable via env so we can point to a
-# Firebase Hosting staging URL during beta and swap to the final
-# landing domain without touching code. `{CHECKOUT_SESSION_ID}` is
-# substituted by Stripe at redirect time.
+# Checkout redirect URLs — overridable via env. Default points to
+# the Firebase Hosting deployment of the `cutly_landing/` folder,
+# which is stable and requires no custom domain. Swap to
+# https://cutly.app/... once the final domain is wired.
+# `{CHECKOUT_SESSION_ID}` is substituted by Stripe at redirect time.
 STRIPE_SUCCESS_URL = os.getenv(
     "STRIPE_SUCCESS_URL",
-    "https://cutly.app/payment-success?session_id={CHECKOUT_SESSION_ID}",
+    "https://cutly-app-ef0ea.web.app/payment-success.html?session_id={CHECKOUT_SESSION_ID}",
 )
 STRIPE_CANCEL_URL = os.getenv(
     "STRIPE_CANCEL_URL",
-    "https://cutly.app/payment-cancel",
+    "https://cutly-app-ef0ea.web.app/payment-cancel.html",
 )
 
 # Credit packs: id → (credits, price_cents).
